@@ -61,7 +61,6 @@ LAST_BATCH_BACKUP = []
 SESSION_MEMORY = ""
 DIFF_LINE_THRESHOLD = 60
 
-# Принудительно заданные пользователем пути к ТЗ и Конспекту через слэш-команды
 FORCED_TZ_PATH: Path | None = None
 FORCED_KONSPEKT_PATH: Path | None = None
 
@@ -76,13 +75,35 @@ CODE_EXTENSIONS = {
 
 
 def bash_input(prompt_text: str) -> str:
-    """Надежный неблокирующий ввод для Git Bash (mintty) и обычных консолей."""
+    """
+    Надежный ввод для Git Bash с поддержкой многострочной вставки (Paste)
+    и автоматической очисткой символов рамок Rich (│).
+    """
     console.print(prompt_text, end="")
     sys.stdout.flush()
-    line = sys.stdin.readline()
-    if not line:
+    first_line = sys.stdin.readline()
+    if not first_line:
         return "/exit"
-    return line.strip()
+
+    lines = [first_line.rstrip("\r\n")]
+
+    # Если пользователь вставил многострочный текст из буфера обмена (в Windows/Git Bash),
+    # считываем оставшиеся строки, которые уже лежат в буфере ввода
+    if os.name == 'nt':
+        try:
+            import msvcrt
+            while msvcrt.kbhit():
+                extra = sys.stdin.readline()
+                if not extra:
+                    break
+                lines.append(extra.rstrip("\r\n"))
+        except Exception:
+            pass
+
+    full_text = "\n".join(lines).strip()
+    # Очищаем случайные символы вертикальных рамок, если скопировали из панели терминала
+    full_text = re.sub(r"[│╭╮╰╯─]+", "", full_text).strip()
+    return full_text
 
 
 def get_default_documents_dir() -> Path:
@@ -112,7 +133,7 @@ def get_project_files(work_dir: Path) -> list[Path]:
 
 
 def extract_python_skeleton(file_path: Path) -> str:
-    """Строит легкий AST-скелет Python-файла (классы и сигнатуры функций за копейки токенов)."""
+    """Строит легкий AST-скелет Python-файла."""
     try:
         source = file_path.read_text(encoding='utf-8', errors='replace')
         tree = ast.parse(source)
@@ -131,7 +152,7 @@ def extract_python_skeleton(file_path: Path) -> str:
 
 
 def build_project_map(work_dir: Path) -> tuple[str, Path | None, Path | None]:
-    """Собирает карту проекта, гибко ищет ТЗ и конспект (с учетом принудительно заданных путей)."""
+    """Собирает карту проекта, гибко ищет ТЗ и конспект (включая транслит вроде konspekt_raboty...)."""
     global FORCED_TZ_PATH, FORCED_KONSPEKT_PATH
     files = get_project_files(work_dir)
     if not files and not FORCED_TZ_PATH and not FORCED_KONSPEKT_PATH:
@@ -140,14 +161,14 @@ def build_project_map(work_dir: Path) -> tuple[str, Path | None, Path | None]:
     tz_file = FORCED_TZ_PATH if (FORCED_TZ_PATH and FORCED_TZ_PATH.exists()) else None
     konspekt_file = FORCED_KONSPEKT_PATH if (FORCED_KONSPEKT_PATH and FORCED_KONSPEKT_PATH.exists()) else None
 
-    # Если путь не задан принудительно, ищем автоматически
     if not tz_file or not konspekt_file:
         for f in files:
             stem_lower = f.stem.lower()
             rel_lower = f.relative_to(work_dir).as_posix().lower()
 
-            if not konspekt_file and any(k in stem_lower for k in ['конспект', 'konspekt', 'changelog', 'progress']):
-                konspekt_file = f
+            if not konspekt_file and any(k in stem_lower for k in ['конспект', 'konspekt', 'conspect', 'changelog', 'progress', 'статус']):
+                if konspekt_file is None or 'docs/' in rel_lower:
+                    konspekt_file = f
                 continue
 
             if not tz_file:
@@ -173,7 +194,7 @@ def build_project_map(work_dir: Path) -> tuple[str, Path | None, Path | None]:
     if konspekt_file:
         try:
             rel_k = konspekt_file.relative_to(work_dir).as_posix() if konspekt_file.is_relative_to(work_dir) else str(konspekt_file)
-            k_text = konspekt_file.read_text(encoding='utf-8', errors='replace')[-20000:]
+            k_text = konspekt_file.read_text(encoding='utf-8', errors='replace')[-25000:]
             sections.append(f"=== КОНСПЕКТ ПРОДЕЛАННЫХ РАБОТ И ПЛАН ({rel_k}) ===\n{k_text}\n")
         except Exception:
             pass
@@ -228,6 +249,71 @@ def find_mentioned_files_content(work_dir: Path, text: str, already_loaded: set[
     return "\n".join(loaded_blocks)
 
 
+def get_active_konspekt_path(work_dir: Path, konspekt_file: Path | None) -> Path:
+    """Определяет целевой файл конспекта для записи."""
+    global FORCED_KONSPEKT_PATH
+    if FORCED_KONSPEKT_PATH:
+        return FORCED_KONSPEKT_PATH
+    if konspekt_file:
+        return konspekt_file
+    docs_dir = work_dir / "src" / "docs"
+    if docs_dir.exists():
+        return docs_dir / "конспект.txt"
+    if (work_dir / "docs").exists():
+        return work_dir / "docs" / "конспект.txt"
+    return work_dir / "конспект.txt"
+
+
+def process_haiku_file_actions(haiku_reply: str, work_dir: Path, konspekt_file: Path | None) -> str:
+    """
+    Перехватывает команды записи/дозаписи файлов от Haiku прямо во время диалога:
+    [APPEND_FILE: путь] ... [/APPEND_FILE]
+    [WRITE_FILE: путь] ... [/WRITE_FILE]
+    И сам сохраняет их на диск!
+    """
+    clean_reply = haiku_reply
+
+    # 1. Обработка дозаписи в конец файла (APPEND_FILE)
+    append_pattern = re.compile(r"\[APPEND_FILE:\s*(.+?)\]\s*\r?\n(.*?)\r?\n\[/APPEND_FILE\]", re.DOTALL)
+    for match in append_pattern.finditer(haiku_reply):
+        raw_path = match.group(1).strip().strip('"\'')
+        content = match.group(2).strip()
+
+        if raw_path.lower() in ['конспект', 'konspekt', 'auto']:
+            target_path = get_active_konspekt_path(work_dir, konspekt_file)
+        else:
+            target_path = Path(raw_path) if Path(raw_path).is_absolute() else (work_dir / raw_path.lstrip("/\\"))
+
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            with open(target_path, "a", encoding="utf-8") as f:
+                f.write(f"\n\n--- Запись от {timestamp} ---\n{content}\n")
+            save_rel = target_path.relative_to(work_dir).as_posix() if target_path.is_relative_to(work_dir) else str(target_path)
+            console.print(f"\n  💾 [bold green]Haiku автоматически дописала в файл:[/bold green] [bold white]{save_rel}[/bold white]")
+        except Exception as e:
+            console.print(f"\n  ❌ [error]Ошибка дозаписи файла {target_path}: {e}[/error]")
+
+    clean_reply = append_pattern.sub("", clean_reply)
+
+    # 2. Обработка полной записи/создания файла (WRITE_FILE)
+    write_pattern = re.compile(r"\[WRITE_FILE:\s*(.+?)\]\s*\r?\n(.*?)\r?\n\[/WRITE_FILE\]", re.DOTALL)
+    for match in write_pattern.finditer(haiku_reply):
+        raw_path = match.group(1).strip().strip('"\'')
+        content = match.group(2).strip()
+        target_path = Path(raw_path) if Path(raw_path).is_absolute() else (work_dir / raw_path.lstrip("/\\"))
+
+        try:
+            save_file_to_batch_backup(target_path, content + "\n")
+            save_rel = target_path.relative_to(work_dir).as_posix() if target_path.is_relative_to(work_dir) else str(target_path)
+            console.print(f"\n  💾 [bold green]Haiku сохранила файл на диск:[/bold green] [bold white]{save_rel}[/bold white]")
+        except Exception as e:
+            console.print(f"\n  ❌ [error]Ошибка сохранения файла {target_path}: {e}[/error]")
+
+    clean_reply = write_pattern.sub("", clean_reply)
+    return clean_reply.strip()
+
+
 def append_to_konspekt(
     work_dir: Path,
     konspekt_file: Path | None,
@@ -235,18 +321,8 @@ def append_to_konspekt(
     next_steps: str,
     modified_files: list[str]
 ):
-    """Записывает развернутый конспект ИИ: что сделано, какие файлы изменены и что делать дальше."""
-    global FORCED_KONSPEKT_PATH
-    target_konspekt = FORCED_KONSPEKT_PATH if FORCED_KONSPEKT_PATH else konspekt_file
-
-    if not target_konspekt:
-        docs_dir = work_dir / "src" / "docs"
-        if docs_dir.exists():
-            target_konspekt = docs_dir / "конспект.txt"
-        elif (work_dir / "docs").exists():
-            target_konspekt = work_dir / "docs" / "конспект.txt"
-        else:
-            target_konspekt = work_dir / "конспект.txt"
+    """Записывает развернутый конспект ИИ после работы DeepSeek."""
+    target_konspekt = get_active_konspekt_path(work_dir, konspekt_file)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     files_str = ", ".join(modified_files)
@@ -270,7 +346,6 @@ def append_to_konspekt(
 
 
 def check_python_syntax(code: str, filename: str) -> str | None:
-    """Бесплатная локальная проверка синтаксиса Python через AST (0 токенов)."""
     if not filename.endswith(".py"):
         return None
     try:
@@ -283,7 +358,6 @@ def check_python_syntax(code: str, filename: str) -> str | None:
 
 
 def run_sandbox_check(code: str, rel_filepath: str, work_dir: Path) -> tuple[bool, str]:
-    """Запускает код или тесты в безопасной песочнице."""
     if not rel_filepath.endswith(".py"):
         return True, "Не Python-файл (проверка запуска пропущена)."
 
@@ -321,10 +395,9 @@ def run_sandbox_check(code: str, rel_filepath: str, work_dir: Path) -> tuple[boo
             mock_input = "10\n20\n5\ntest\ny\n0\n"
             cmd = [sys.executable, str(temp_file)]
             proc = subprocess.run(cmd, cwd=str(work_dir), input=mock_input, capture_output=True, text=True, timeout=4, env=env)
-            output = (proc.stdout + "\n" + proc.stderr).strip()
             if proc.returncode != 0 and "EOFError" not in proc.stderr:
                 return False, f"Скрипт упал с ошибкой:\n{proc.stderr[-1500:]}"
-            return True, f"Скрипт успешно запустился (код 0)."
+            return True, "Скрипт успешно запустился (код 0)."
     except subprocess.TimeoutExpired:
         return True, "Скрипт запустился без сбоев (остановлен по таймауту песочницы 4с)."
     except Exception as e:
@@ -338,7 +411,6 @@ def run_sandbox_check(code: str, rel_filepath: str, work_dir: Path) -> tuple[boo
 
 
 def apply_search_replace(original_code: str, patch_response: str) -> tuple[str | None, str | None]:
-    """Применяет блоки SEARCH/REPLACE к исходному коду."""
     pattern = re.compile(
         r"<<<<<<< SEARCH[ \t]*\r?\n(.*?)\r?\n=======[ \t]*\r?\n(.*?)\r?\n>>>>>>> REPLACE",
         re.DOTALL
@@ -373,17 +445,27 @@ def apply_search_replace(original_code: str, patch_response: str) -> tuple[str |
     return modified_code, None
 
 
-def chat_with_haiku_turn(project_map: str, chat_messages: list[dict]) -> str:
-    """Один шаг живого диалога с Haiku с поддержкой памяти текущих пунктов."""
+def chat_with_haiku_turn(project_map: str, chat_messages: list[dict], active_konspekt_rel: str) -> str:
+    """Один шаг живого диалога с Haiku с правом прямой записи документов и конспектов на диск."""
     global SESSION_MEMORY
+    today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
     system_prompt = (
-        "Ты — ведущий системный аналитик и Tech Lead проекта. Пользователь — руководитель разработки.\n"
-        "У тебя перед глазами ТЗ проекта, конспект прошлых работ (со списком следующих шагов) и карта всех папок.\n\n"
-        "ТВОЯ РОЛЬ В ДИАЛОГЕ:\n"
-        "1. Помогай руководителю декомпозировать задачи на четкие пункты (Пункт 1, Пункт 2, Пункт 3...), обсуждай архитектуру.\n"
-        "2. Отвечай кратко, структурированно (используй списки и жирный шрифт Markdown).\n"
-        "3. Если руководитель просит выполнить конкретный пункт из плана (или набрал команду /go) — "
-        "подтверди старт именно этого пункта и обязательно добавь в самом конце ответа маркер [START_CODING]."
+        f"Ты — ведущий системный аналитик и Tech Lead проекта. Пользователь — руководитель разработки. Текущая дата: {today_str}.\n"
+        "У тебя перед глазами ТЗ проекта, конспект прошлых работ и карта всех папок.\n\n"
+        "ВАЖНО — ТВОИ ВОЗМОЖНОСТИ ЗАПИСИ ФАЙЛОВ НА ДИСК:\n"
+        "Никогда НЕ говори руководителю 'я не могу записывать файлы на диск'! Наш оркестратор автоматически исполняет твои файловые блоки:\n"
+        f"1. Если руководитель просит сохранить статус, записать на чём остановились, обновить конспект или зафиксировать паузу — "
+        f"сформируй структурированный текст и оберни его в тег дозаписи (файл конспекта сейчас: {active_konspekt_rel}):\n"
+        f"[APPEND_FILE: {active_konspekt_rel}]\n"
+        "текст для добавления в конец конспекта (с актуальной датой)\n"
+        "[/APPEND_FILE]\n\n"
+        "2. Если руководитель просит создать или полностью перезаписать текстовый документ/список вопросов/ТЗ (например, src/docs/вопрос.txt или статус) — оберни его в тег:\n"
+        "[WRITE_FILE: относительный/путь/к/файлу.txt]\n"
+        "полное содержимое файла\n"
+        "[/WRITE_FILE]\n\n"
+        "3. Если же руководитель просит написать/изменить программный КОД (.py и др.) по плану или выполнить пункт разработки — "
+        "подтверди старт и добавь в самом конце ответа маркер [START_CODING] (это запустит конвейер DeepSeek + Песочница + Sonnet)."
     )
 
     memory_block = f"\n=== АКТИВНЫЙ ПЛАН ТЕКУЩЕЙ СЕССИИ ===\n{SESSION_MEMORY}\n" if SESSION_MEMORY else ""
@@ -658,7 +740,6 @@ def execute_plan_pipeline(work_dir: Path, project_map: str, konspekt_file: Path 
 
 def render_dashboard(work_dir: Path, total_files: int, tz_file: Path | None, konspekt_file: Path | None):
     """Рисует информационную панель проекта в терминале."""
-    global FORCED_TZ_PATH, FORCED_KONSPEKT_PATH
     table = Table(show_header=False, box=None, padding=(0, 1))
     table.add_column("Key", style="bold cyan")
     table.add_column("Value")
@@ -673,14 +754,14 @@ def render_dashboard(work_dir: Path, total_files: int, tz_file: Path | None, kon
         table.add_row("🧠 Память сессии:", "[bold magenta]Активна[/bold magenta]")
 
     table.add_row(
-        "⌨️ Слэш-команды:",
-        "[bold yellow]/go[/bold yellow] | [bold yellow]/go![/bold yellow] | [bold yellow]/tz <путь>[/bold yellow] | [bold yellow]/konspekt <путь>[/bold yellow] | [bold yellow]/undo[/bold yellow] | [bold yellow]/clear[/bold yellow] | [bold yellow]/dir[/bold yellow] | [bold yellow]/exit[/bold yellow]"
+        "⌨️ Команды:",
+        "[bold yellow]/go[/bold yellow] | [bold yellow]/go![/bold yellow] | [bold yellow]/save[/bold yellow] (записать паузу в конспект) | [bold yellow]/tz <путь>[/bold yellow] | [bold yellow]/konspekt <путь>[/bold yellow] | [bold yellow]/undo[/bold yellow] | [bold yellow]/clear[/bold yellow] | [bold yellow]/exit[/bold yellow]"
     )
 
     console.print()
     console.print(Panel(
         table,
-        title="[bold cyan]🚀 AI CODE ORCHESTRATOR v4.5 (Slash Commands)[/bold cyan]",
+        title="[bold cyan]🚀 AI CODE ORCHESTRATOR v4.6 (Direct File Writer & Save)[/bold cyan]",
         subtitle="[dim]Haiku 5.5 ➔ DeepSeek ➔ Sandbox ➔ Sonnet 5.5[/dim]",
         border_style="bright_blue",
         box=box.ROUNDED
@@ -709,6 +790,9 @@ def main():
 
     while True:
         project_map, tz_file, konspekt_file = build_project_map(work_dir)
+        active_k_path = get_active_konspekt_path(work_dir, konspekt_file)
+        active_k_rel = active_k_path.relative_to(work_dir).as_posix() if active_k_path.is_relative_to(work_dir) else str(active_k_path)
+
         total_files = len(get_project_files(work_dir))
         render_dashboard(work_dir, total_files, tz_file, konspekt_file)
 
@@ -716,15 +800,14 @@ def main():
         loaded_files_in_chat = set()
 
         while True:
-            prompt_str = "\n[bold green]💬 Вы (обсудите план или введите /go):[/bold green] "
+            prompt_str = "\n[bold green]💬 Вы (обсудите план, /save — сохранить в конспект, /go — в код):[/bold green] "
             user_input = bash_input(prompt_str)
             if not user_input:
                 continue
 
             cmd_lower = user_input.lower()
 
-            # Обработка слэш-команд
-            if cmd_lower in ['/exit', '/quit', '/q']:
+            if cmd_lower in ['/exit', '/quit', '/q', 'exit']:
                 console.print("\n👋 [bold cyan]До встречи![/bold cyan]")
                 return
             if cmd_lower == '/undo':
@@ -747,9 +830,9 @@ def main():
                     p = (work_dir / p).resolve()
                 if p.exists():
                     FORCED_TZ_PATH = p
-                    console.print(f"✅ [green]ТЗ успешно принудительно подключено:[/green] {p}")
+                    console.print(f"✅ [green]ТЗ успешно подключено:[/green] {p}")
                 else:
-                    console.print(f"❌ [error]Файл ТЗ не найден по пути:[/error] {p}")
+                    console.print(f"❌ [error]Файл ТЗ не найден:[/error] {p}")
                 break
             if cmd_lower.startswith('/konspekt '):
                 p_str = user_input[10:].strip().strip('"\'')
@@ -758,9 +841,9 @@ def main():
                     p = (work_dir / p).resolve()
                 if p.exists():
                     FORCED_KONSPEKT_PATH = p
-                    console.print(f"✅ [green]Конспект успешно принудительно подключен:[/green] {p}")
+                    console.print(f"✅ [green]Конспект успешно подключен:[/green] {p}")
                 else:
-                    console.print(f"❌ [error]Файл конспекта не найден по пути:[/error] {p}")
+                    console.print(f"❌ [error]Файл конспекта не найден:[/error] {p}")
                 break
             if cmd_lower in ['/go', '/go!']:
                 if not chat_messages:
@@ -769,7 +852,13 @@ def main():
                 execute_plan_pipeline(work_dir, project_map, konspekt_file, chat_messages, fast_mode=(cmd_lower == '/go!'))
                 break
 
-            # Обычное сообщение в диалог с Haiku
+            # Если ввели /save или /pause — просим Haiku तुरंत сохранить итог беседы в конспект
+            if cmd_lower in ['/save', '/pause']:
+                user_input = (
+                    f"Оформи подробный статус того, на чём мы сейчас остановились (решения, открытые вопросы и следующий шаг), "
+                    f"и обязательно сохрани его в конец конспекта через блок [APPEND_FILE: {active_k_rel}] ... [/APPEND_FILE]."
+                )
+
             extra_code = find_mentioned_files_content(work_dir, user_input, loaded_files_in_chat)
             full_msg = user_input
             if extra_code:
@@ -778,19 +867,23 @@ def main():
             chat_messages.append({"role": "user", "content": full_msg})
 
             try:
-                haiku_reply = chat_with_haiku_turn(project_map, chat_messages)
+                haiku_reply = chat_with_haiku_turn(project_map, chat_messages, active_k_rel)
                 chat_messages.append({"role": "assistant", "content": haiku_reply})
 
-                if "[START_CODING]" in haiku_reply:
-                    clean_reply = haiku_reply.replace("[START_CODING]", "").strip()
+                # Автоматически исполняем [APPEND_FILE] и [WRITE_FILE], если Haiku их выдала
+                display_reply = process_haiku_file_actions(haiku_reply, work_dir, konspekt_file)
+
+                if "[START_CODING]" in display_reply:
+                    clean_reply = display_reply.replace("[START_CODING]", "").strip()
                     if clean_reply:
                         console.print()
                         console.print(Panel(Markdown(clean_reply), title="[bold cyan]🤖 Haiku 5.5 (Tech Lead)[/bold cyan]", border_style="cyan", box=box.ROUNDED))
                     execute_plan_pipeline(work_dir, project_map, konspekt_file, chat_messages, fast_mode=False)
                     break
                 else:
-                    console.print()
-                    console.print(Panel(Markdown(haiku_reply), title="[bold cyan]🤖 Haiku 5.5 (Tech Lead)[/bold cyan]", border_style="cyan", box=box.ROUNDED))
+                    if display_reply:
+                        console.print()
+                        console.print(Panel(Markdown(display_reply), title="[bold cyan]🤖 Haiku 5.5 (Tech Lead)[/bold cyan]", border_style="cyan", box=box.ROUNDED))
 
             except Exception as e:
                 console.print(f"\n❌ [error]Ошибка связи с моделью:[/error] {e}")
